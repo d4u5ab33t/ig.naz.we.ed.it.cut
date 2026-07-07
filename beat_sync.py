@@ -1,11 +1,174 @@
-(updated) beat_sync.py: added --use-shot-matching handling
-# Note: Only a small change is applied here — we augment process_track to consult the DB
-# The full file is large; below we patch the relevant function by adding a hook.
+#!/usr/bin/env python3
+"""
+beat_sync.py — minimal beat-sync renderer with plugin-driven VFX -> FFmpeg filter mapping
+This file integrates the plugin manager and maps plugin effect names to ffmpeg -vf filter strings.
+"""
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import subprocess
+import tempfile
+import time
+import random
+import json
+import os
+from typing import List
 
-# Patch instructions:
-# - Adds CLI arg --use-shot-matching
-# - After computing similarities, if use_shot_matching enabled, read shot_type from DB and add a small bonus
+from db import WeeditDB
+from clip_indexer import ClipIndexer
+from plugins import get_plugin_manager
 
-# Implementation notes (already applied by commit):
-# If you maintain a local copy of beat_sync.py the behavior will now accept --use-shot-matching
-# and will look up clip metadata in D:/Oidasheim/weedit/weedit_v4.db
+# simple defaults
+DEFAULT_MUSIC_DIR = Path(r"D:/Oidasheim/NFOs/mp3s")
+DEFAULT_CLIPS_DIR = Path(r"D:/raw_vidz/grok")
+OUTPUT_DIR = Path(r"D:/Oidasheim/NFOs/done")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+EFFECTS_MAP = {
+    'colorgrade_mild': "eq=contrast=1.05:brightness=0.02:saturation=1.05",
+    'color_pop': "eq=contrast=1.15:saturation=1.2",
+    'neon_pulse': "colorchannelmixer=1.2:0:0:0:0:1.2:0:0:0:0:1.2",
+    'soft_fade': "fade=t=in:st=0:d=0.12",
+    'clean': "",
+    'flash_white': "eq=brightness=0.15",
+    'wobble_zoom': "zoompan=z='1.0+0.02*sin(2*PI*t*2)':d=1",
+    'stutter': "tblend=all_mode='average'",
+    'flash_white': "eq=brightness=0.15",
+}
+
+
+def build_vf_from_effects(effects: List[str]) -> str:
+    parts = []
+    for e in effects:
+        f = EFFECTS_MAP.get(e)
+        if f:
+            parts.append(f)
+    return ",".join(parts)
+
+
+def require_tool(name: str) -> str:
+    from shutil import which
+    p = which(name)
+    if not p:
+        raise RuntimeError(f"{name} not found on PATH")
+    return p
+
+
+def simple_render_segment(ffmpeg, clip_path, start, dur, out_path, vf=''):
+    cmd = [ffmpeg, '-y', '-ss', f'{start:.3f}', '-i', str(clip_path), '-t', f'{dur:.3f}', '-an']
+    if vf:
+        cmd += ['-vf', vf]
+    cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', str(out_path)]
+    subprocess.run(cmd, check=True)
+
+
+def choose_clip_for_segment(db: WeeditDB, desired_shot: str, rng: random.Random):
+    cands = db.get_all_clips()
+    # prefer same shot_type
+    same = [c for c in cands if c.get('shot_type') == desired_shot]
+    pool = same if same else cands
+    if not pool:
+        raise RuntimeError('No clips available in DB')
+    return rng.choice(pool)
+
+
+def concat_and_mux(ffmpeg: str, segment_paths: List[str], music_path: Path, output_path: Path, work_dir: Path):
+    concat_file = work_dir / 'concat.txt'
+    with open(concat_file, 'w', encoding='utf-8') as f:
+        for p in segment_paths:
+            f.write(f"file '{Path(p).as_posix()}'\n")
+    silent_video = work_dir / 'silent_video.mp4'
+    subprocess.run([ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', str(concat_file), '-c', 'copy', str(silent_video)], check=True)
+    subprocess.run([ffmpeg, '-y', '-i', str(silent_video), '-i', str(music_path), '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', str(output_path)], check=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--music-dir', default=str(DEFAULT_MUSIC_DIR))
+    parser.add_argument('--clips-dir', default=str(DEFAULT_CLIPS_DIR))
+    parser.add_argument('--music')
+    parser.add_argument('--use-shot-matching', action='store_true')
+    parser.add_argument('--reindex', action='store_true')
+    parser.add_argument('--db', default=r'D:/Oidasheim/weedit/weedit_v4.db')
+    args = parser.parse_args()
+
+    ffmpeg = require_tool('ffmpeg')
+    ffprobe = require_tool('ffprobe')
+
+    db = WeeditDB(args.db)
+    db._init_db()  # ensure schema present
+
+    idx = ClipIndexer()
+    if args.reindex:
+        print('Reindexing...')
+        idx.index_all()
+
+    # load plugin manager
+    pm = get_plugin_manager()
+
+    # select music
+    if args.music:
+        music_path = Path(args.music)
+    else:
+        tracks = list(Path(args.music_dir).glob('*'))
+        tracks = [t for t in tracks if t.suffix.lower() in ('.mp3', '.m4a', '.wav')]
+        if not tracks:
+            raise SystemExit('No music found')
+        music_path = tracks[0]
+
+    # duration probe
+    try:
+        import json
+        r = subprocess.run([ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', str(music_path)], capture_output=True, text=True, timeout=10)
+        duration = float(r.stdout.strip())
+    except Exception:
+        duration = 120.0
+
+    # build cut grid: simple every 2s
+    step = 2.0
+    cut_points = [round(t, 3) for t in range(0, int(duration), int(step))]
+    if cut_points[-1] != duration:
+        cut_points.append(duration)
+
+    segments = []
+    rng = random.Random(7)
+    for a, b in zip(cut_points, cut_points[1:]):
+        seg = {'start': a, 'dur': round(b - a, 3), 'energy': rng.random(), 'section': 'verse'}
+        segments.append(seg)
+
+    # for each segment, ask plugins for suggested effects
+    for seg in segments:
+        # allow plugin to inspect segment metadata and suggest effects
+        try:
+            plugin_effects = pm.select_effects(seg)
+        except Exception:
+            plugin_effects = []
+        seg.setdefault('effects', [])
+        for ef in plugin_effects:
+            if ef not in seg['effects']:
+                seg['effects'].append(ef)
+
+    # render segments
+    with tempfile.TemporaryDirectory(prefix='weedit_') as td:
+        work_dir = Path(td)
+        segment_paths = []
+        for i, seg in enumerate(segments):
+            desired_shot = rng.choice(['standard', 'wide', 'action', 'static', 'cutaway']) if args.use_shot_matching else 'standard'
+            clip_meta = choose_clip_for_segment(db, desired_shot, rng)
+            vf = build_vf_from_effects(seg.get('effects', []))
+            out_seg = work_dir / f'seg_{i:04d}.mp4'
+            try:
+                simple_render_segment(ffmpeg, clip_meta['path'], 0.0, seg['dur'], out_seg, vf=vf)
+                segment_paths.append(str(out_seg))
+            except Exception as e:
+                print('Failed render segment:', e)
+
+        # mux
+        ts = int(time.time())
+        output_path = OUTPUT_DIR / f'weedit_{music_path.stem}_{ts}.mp4'
+        concat_and_mux(ffmpeg, segment_paths, music_path, output_path, work_dir)
+        print('Wrote', output_path)
+
+
+if __name__ == '__main__':
+    main()
