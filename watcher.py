@@ -1,54 +1,64 @@
 #!/usr/bin/env python3
 # watcher.py
 """
-Simple background folder watcher that triggers clip indexer updates when new files arrive.
-Requires watchdog.
+Folder watcher daemon: watches clip folders and triggers indexer for new files.
+Requires watchdog (pip install watchdog)
+Usage:
+    python watcher.py --watch D:/raw_vidz/grok --db D:/Oidasheim/weedit/weedit_v4.db
 """
+from __future__ import annotations
+
+import argparse
+import threading
 import time
 from pathlib import Path
-import subprocess
-import sys
 
 try:
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
-except ImportError:
+except Exception:
     print('Please install watchdog: pip install watchdog')
-    sys.exit(1)
+    raise
 
-class _EventHandler(FileSystemEventHandler):
-    def __init__(self, index_cmd: str):
-        super().__init__()
-        self.index_cmd = index_cmd
+
+class ClipEventHandler(FileSystemEventHandler):
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+
     def on_created(self, event):
-        if event.is_directory: return
-        print(f"[watcher] file created: {event.src_path}")
-        subprocess.Popen(self.index_cmd, shell=True)
-    def on_moved(self, event):
-        if event.is_directory: return
-        print(f"[watcher] file moved: {event.dest_path}")
-        subprocess.Popen(self.index_cmd, shell=True)
+        if event.is_directory:
+            return
+        p = Path(event.src_path)
+        if p.suffix.lower() in ('.mp4','.mov','.mkv','.avi'):
+            # call indexer for this file
+            from clip_indexer import ensure_db, index_clip
+            conn = ensure_db(self.db_path)
+            print(f"[watcher] New clip detected: {p.name}")
+            index_clip(conn, p, force=True)
+            conn.close()
 
 
-def main(paths):
-    index_cmd = 'python clip_indexer.py --reindex'
-    handler = _EventHandler(index_cmd)
-    obs = Observer()
-    for p in paths:
-        print(f"[watcher] watching: {p}")
-        obs.schedule(handler, str(p), recursive=True)
-    obs.start()
+def run_watch(path: Path, db_path: Path):
+    event_handler = ClipEventHandler(db_path)
+    observer = Observer()
+    observer.schedule(event_handler, str(path), recursive=True)
+    observer.start()
+    print(f"Watching {path} ...")
     try:
         while True:
-            time.sleep(1.0)
+            time.sleep(1)
     except KeyboardInterrupt:
-        obs.stop()
-    obs.join()
+        observer.stop()
+    observer.join()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--watch', '-w', required=True)
+    parser.add_argument('--db', default=r"D:/Oidasheim/weedit/weedit_v4.db")
+    args = parser.parse_args()
+    run_watch(Path(args.watch), Path(args.db))
+
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('paths', nargs='*')
-    args = parser.parse_args()
-    watch_paths = args.paths if args.paths else ['D:/raw_vidz/grok']
-    main(watch_paths)
+    main()

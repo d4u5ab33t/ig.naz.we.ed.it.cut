@@ -1,36 +1,53 @@
 #!/usr/bin/env python3
-"""hardware.py - detect platform and available acceleration/hw"""
+# hardware.py
+"""
+Hardware detection & optimization helpers. Lightweight and cross-platform.
+"""
+from __future__ import annotations
+
 import platform
 import shutil
 import subprocess
+from typing import Dict
 
 
-def detect_gpu():
-    # check for nvidia-smi and ffmpeg encoders
+def detect_hardware() -> Dict:
+    info = {}
+    info['platform'] = platform.system()
+    info['machine'] = platform.machine()
+
+    # CPU
     try:
-        res = subprocess.run(['nvidia-smi','-L'], capture_output=True, text=True, timeout=2)
-        if res.returncode == 0 and 'GPU' in res.stdout:
-            return 'nvidia'
+        import psutil
+        info['cpu_count_logical'] = psutil.cpu_count()
+        info['memory_total_gb'] = round(psutil.virtual_memory().total / (1024**3), 1)
     except Exception:
-        pass
-    # check ffmpeg encoders
+        info['cpu_count_logical'] = None
+        info['memory_total_gb'] = None
+
+    # GPU (NVIDIA detection via nvidia-smi)
+    nvidia = shutil.which('nvidia-smi')
+    if nvidia:
+        try:
+            out = subprocess.run(['nvidia-smi','--query-gpu=name,memory.total','--format=csv,noheader'], capture_output=True, text=True, timeout=3)
+            lines = out.stdout.strip().splitlines()
+            info['gpus'] = [l.strip() for l in lines if l.strip()]
+        except Exception:
+            info['gpus'] = []
+    else:
+        info['gpus'] = []
+
+    # Raspberry Pi detection
     try:
-        r = subprocess.run(['ffmpeg','-hide_banner','-encoders'], capture_output=True, text=True, timeout=3)
-        out = r.stdout
-        if 'h264_nvenc' in out:
-            return 'nvenc'
-        if 'h264_qsv' in out:
-            return 'qsv'
-        if 'h264_amf' in out:
-            return 'amf'
+        with open('/proc/device-tree/model','r') as f:
+            model = f.read().lower()
+            info['is_raspberry_pi'] = 'raspberry' in model
     except Exception:
-        pass
-    return None
+        info['is_raspberry_pi'] = False
 
+    return info
 
-def cpu_info():
-    return platform.processor() or platform.machine()
 
 if __name__ == '__main__':
-    print('cpu:', cpu_info())
-    print('gpu:', detect_gpu())
+    import json
+    print(json.dumps(detect_hardware(), indent=2))

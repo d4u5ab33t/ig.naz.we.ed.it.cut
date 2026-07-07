@@ -1,140 +1,158 @@
 #!/usr/bin/env python3
 # clip_indexer.py
 """
-Clip indexer: scans clip pools, computes fast scene fingerprints,
-color histogram, shot type and motion score and stores into SQLite DB.
+Lightweight clip indexer for WEEDIT Phase‑3
+- Scans a set of clip pool paths (local + network aliases)
+- Computes fast scene fingerprints and color histogram summary
+- Estimates motion / shot_type
+- Stores results in a sqlite DB (creates schema if missing)
+
+Usage:
+    python clip_indexer.py --dir D:\raw_vidz\grok --db D:/Oidasheim/weedit/weedit_v4.db --reindex
 """
-from pathlib import Path
+
+from __future__ import annotations
+
+import argparse
 import os
-import json
-import hashlib
-import time
+import sqlite3
 import subprocess
-from typing import List, Dict, Any
+import sys
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
 
-from preprocessor import VideoPreprocessor
-from clip_pools import resolve_pools
-from db import WeeditDB
+import cv2
+import numpy as np
 
-FFPROBE = 'ffprobe'
+from scene_fingerprint import frame_dhash, dominant_color, color_histogram_summary, estimate_motion_score
+
+DEFAULT_DB = r"D:/Oidasheim/weedit/weedit_v4.db"
+SUPPORTED_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.mpg', '.mp4'}
 
 
-def _ffprobe_duration(path: Path) -> float:
+def ensure_db(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("CREATE TABLE IF NOT EXISTS clips ("
+                "path TEXT PRIMARY KEY, filename TEXT, duration REAL, "
+                "fingerprint TEXT, color_summary TEXT, motion REAL, shot_type TEXT, tags TEXT, indexed_ts INTEGER)")
+    conn.commit()
+    return conn
+
+
+def ffprobe_duration(path: Path, timeout: int = 8) -> float:
     try:
-        r = subprocess.run([FFPROBE, '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', str(path)], capture_output=True, text=True, timeout=10)
-        return float(r.stdout.strip())
+        out = subprocess.run([
+            'ffprobe','-v','error','-show_entries','format=duration',
+            '-of','default=noprint_wrappers=1:nokey=1', str(path)
+        ], capture_output=True, text=True, timeout=timeout)
+        if out.returncode == 0 and out.stdout:
+            return float(out.stdout.strip())
     except Exception:
-        return 0.0
+        pass
+    return 0.0
 
 
-def color_histogram(path: Path, sample_frames: int = 3, bins: int = 16) -> List[float]:
-    import cv2
-    cap = cv2.VideoCapture(str(path))
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if frame_count <= 0:
-        cap.release()
-        return [0.0] * (bins * 3)
-    positions = [int(frame_count * (i + 1) / (sample_frames + 1)) for i in range(sample_frames)]
-    hist_acc = [0.0] * (bins * 3)
-    for pos in positions:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        for c in range(3):
-            hist = cv2.calcHist([frame], [c], None, [bins], [0, 256]).flatten()
-            hist = hist / (hist.sum() + 1e-9)
-            for i, v in enumerate(hist):
-                hist_acc[c * bins + i] += float(v)
-    cap.release()
-    # average
-    for i in range(len(hist_acc)):
-        hist_acc[i] = hist_acc[i] / max(1, sample_frames)
-    return [float(x) for x in hist_acc]
+def scan_folder(folder: Path) -> List[Path]:
+    if not folder.exists():
+        return []
+    files: List[Path] = []
+    for p in folder.rglob('*'):
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
+            files.append(p)
+    return sorted(files)
 
 
-def shot_type_guess(path: Path, motion_score: float, duration: float) -> str:
-    # Simple heuristic: aspect ratio + motion
-    try:
-        import cv2
-        cap = cv2.VideoCapture(str(path))
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
-    except Exception:
-        w, h = 1920, 1080
-    ar = w / max(1, h)
+def classify_shot(motion_score: float, dom_color: Tuple[int,int,int]) -> str:
+    # Simple rule-based shot typing
+    r,g,b = dom_color
+    brightness = (r+g+b)/3.0
     if motion_score > 0.6:
         return 'action'
-    if ar > 2.0:
-        return 'ultrawide'
-    if ar > 1.4:
-        return 'wide'
-    if ar < 0.75:
-        return 'portrait'
-    if duration < 1.5:
-        return 'cutaway'
-    return 'standard'
+    if motion_score > 0.25:
+        return 'dynamic'
+    if brightness < 40:
+        return 'dark'
+    if brightness > 200:
+        return 'bright'
+    return 'steady'
 
 
-def fingerprint_from_features(hist: List[float], motion: float, shot_type: str) -> str:
-    m = hashlib.sha1()
-    payload = json.dumps({'h': hist[:8], 'm': round(motion,3), 's': shot_type}).encode('utf-8')
-    m.update(payload)
-    return m.hexdigest()[:16]
+def index_clip(conn: sqlite3.Connection, clip_path: Path, force: bool = False) -> Optional[Dict]:
+    cur = conn.cursor()
+    key = str(clip_path)
+    if not force:
+        row = cur.execute('SELECT indexed_ts FROM clips WHERE path=?', (key,)).fetchone()
+        if row:
+            return None
+
+    # Try to open video and analyze a few frames
+    try:
+        cap = cv2.VideoCapture(str(clip_path))
+        if not cap.isOpened():
+            cap.release()
+            return None
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        dur = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+        # Prefer ffprobe fallback for exact duration
+        duration = ffprobe_duration(clip_path) or 0.0
+
+        # Choose frames: start, middle, end
+        frames = []
+        picks = [0, max(0, frame_count//2), max(0, frame_count-1)]
+        for p in picks:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(p))
+            ret, f = cap.read()
+            if not ret:
+                continue
+            frames.append(f)
+        cap.release()
+
+        if not frames:
+            return None
+
+        # Fingerprint from middle frame
+        mid = frames[len(frames)//2]
+        fp = frame_dhash(mid)
+        domc = dominant_color(mid)
+        hist_summary = color_histogram_summary(mid)
+        motion = estimate_motion_score(frames)
+        shot_type = classify_shot(motion, domc)
+
+        cur.execute('INSERT OR REPLACE INTO clips (path, filename, duration, fingerprint, color_summary, motion, shot_type, tags, indexed_ts) VALUES (?,?,?,?,?,?,?,?,strftime("%s","now"))', (
+            key, clip_path.name, float(duration), fp, hist_summary, float(motion), shot_type, '',
+        ))
+        conn.commit()
+        return {'path': key, 'duration': duration, 'fingerprint': fp, 'color_summary': hist_summary, 'motion': motion, 'shot_type': shot_type}
+
+    except Exception as e:
+        print(f"[index_clip] Failed {clip_path}: {e}")
+        return None
 
 
-class ClipIndexer:
-    def __init__(self, db_path: str = None, pools: List[str] | None = None):
-        self.db = WeeditDB(db_path) if db_path else WeeditDB()
-        self.pools = pools or resolve_pools()
-        self.vproc = VideoPreprocessor()
+def reindex_dir(folder: Path, db_path: Path, force: bool = False):
+    conn = ensure_db(db_path)
+    files = scan_folder(folder)
+    print(f"Found {len(files)} clips in {folder}")
+    for i, f in enumerate(files, 1):
+        sys.stdout.write(f"Indexing {i}/{len(files)}: {f.name}... ")
+        sys.stdout.flush()
+        res = index_clip(conn, f, force=force)
+        print('OK' if res else 'SKIP')
+    conn.close()
 
-    def index_file(self, p: str) -> Dict[str, Any]:
-        path = Path(p)
-        if not path.exists():
-            return {}
-        duration = _ffprobe_duration(path)
-        motion = self.vproc.analyze_motion_score(str(path), samples=5)
-        hist = color_histogram(path, sample_frames=3, bins=16)
-        shot = shot_type_guess(path, motion, duration)
-        fingerprint = fingerprint_from_features(hist, motion, shot)
-        entry = {
-            'path': str(path),
-            'filename': path.name,
-            'duration': float(duration),
-            'motion': float(motion),
-            'color_hist': hist,
-            'shot_type': shot,
-            'fingerprint': fingerprint,
-            'last_indexed': int(time.time())
-        }
-        self.db.upsert_clip(entry)
-        return entry
 
-    def index_all(self, reindex: bool = False) -> int:
-        files = []
-        for pool in self.pools:
-            for root, dirs, filenames in os.walk(pool):
-                for fn in filenames:
-                    if fn.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.webm')):
-                        files.append(os.path.join(root, fn))
-        count = 0
-        for f in files:
-            try:
-                self.index_file(f)
-                count += 1
-            except Exception:
-                pass
-        return count
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dir', '-d', type=str, required=True)
+    parser.add_argument('--db', type=str, default=DEFAULT_DB)
+    parser.add_argument('--reindex', action='store_true')
+    args = parser.parse_args()
+    folder = Path(args.dir)
+    reindex_dir(folder, Path(args.db), force=args.reindex)
 
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--reindex', action='store_true')
-    parser.add_argument('--db', type=str, help='db path')
-    args = parser.parse_args()
-    idx = ClipIndexer(db_path=args.db)
-    n = idx.index_all(reindex=args.reindex)
-    print(f"Indexed {n} clips")
+    main()
