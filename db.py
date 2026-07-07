@@ -7,6 +7,7 @@ import time
 import shutil
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import re
 
 DEFAULT_DB_PATH = Path(r"D:/Oidasheim/weedit/weedit_v4.db")
 DEFAULT_DB_CANDIDATES = [
@@ -174,3 +175,35 @@ class WeeditDB:
         with self._conn() as conn:
             conn.execute("UPDATE clips SET uses = uses + 1, last_indexed = ? WHERE path = ?", (int(time.time()), path))
             conn.commit()
+
+    def snapshot_db(self, sritzp_name: str) -> Path:
+        """
+        Create a versioned snapshot copy of the current DB using pattern:
+        {sritzp_name}-{version}-Clip.db
+        where version is incremented automatically.
+        Returns the Path to the new snapshot.
+        """
+        base_dir = self.db_path.parent
+        pattern = re.compile(rf"^{re.escape(sritzp_name)}-(\d+)-Clip\.db$")
+        max_v = 0
+        for p in base_dir.iterdir():
+            if not p.is_file():
+                continue
+            m = pattern.match(p.name)
+            if m:
+                try:
+                    v = int(m.group(1))
+                    if v > max_v:
+                        max_v = v
+                except Exception:
+                    continue
+        new_v = max_v + 1
+        new_name = f"{sritzp_name}-{new_v}-Clip.db"
+        new_path = base_dir / new_name
+        try:
+            shutil.copy(self.db_path, new_path)
+            print(f"Snapshot DB created: {new_path}")
+            return new_path
+        except Exception as e:
+            print(f"Failed to snapshot DB: {e}")
+            return self.db_path
