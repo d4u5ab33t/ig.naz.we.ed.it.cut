@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Updated clip_indexer to build a small cache JSON and optional Annoy index.
+Updated clip_indexer to call update_ann_index for incremental ANN updates.
 """
 from __future__ import annotations
 import argparse
@@ -12,7 +12,7 @@ import time
 import cv2
 
 from scene_fingerprint import extract_keyframe, dhash, color_histogram, shot_type_from_stats
-from ann_index import build_annoy_index
+from ann_index import update_ann_index
 
 DEFAULT_DB = r"D:/Oidasheim/weedit/weedit_v4.db"
 CACHE_JSON = r"D:/Oidasheim/weedit/weedit_clip_cache.json"
@@ -79,7 +79,7 @@ def index_clip(conn, path: Path, cache: dict):
         return False
 
 
-def scan_and_index(folder: str, db_path: str, cache_out: str = CACHE_JSON, build_annoy: bool = True):
+def scan_and_index(folder: str, db_path: str, cache_out: str = CACHE_JSON, update_ann: bool = True):
     conn = init_db(db_path)
     folder = Path(folder)
     files = [p for p in folder.rglob('*') if p.suffix.lower() in ('.mp4', '.mov', '.mkv', '.avi')]
@@ -95,13 +95,13 @@ def scan_and_index(folder: str, db_path: str, cache_out: str = CACHE_JSON, build
         print(f"Wrote cache json: {cache_out}")
     except Exception as e:
         print(f"Failed writing cache: {e}")
-    # build annoy
+    # incremental annoy update
     try:
-        if build_annoy:
-            ok = build_annoy_index(cache_out, ANNOY_PREFIX)
-            print('Annoy index built:', ok)
+        if update_ann:
+            ok = update_ann_index(cache_out, ANNOY_PREFIX)
+            print('Annoy index updated:', ok)
     except Exception as e:
-        print('Annoy build failed:', e)
+        print('Annoy update failed:', e)
     finally:
         conn.close()
 
@@ -111,6 +111,6 @@ if __name__ == '__main__':
     parser.add_argument('--clips', required=True)
     parser.add_argument('--db', default=DEFAULT_DB)
     parser.add_argument('--cache', default=CACHE_JSON)
-    parser.add_argument('--no-ann', dest='build_ann', action='store_false')
+    parser.add_argument('--no-ann', dest='update_ann', action='store_false')
     args = parser.parse_args()
-    scan_and_index(args.clips, args.db, cache_out=args.cache, build_annoy=args.build_ann)
+    scan_and_index(args.clips, args.db, cache_out=args.cache, update_ann=args.update_ann)

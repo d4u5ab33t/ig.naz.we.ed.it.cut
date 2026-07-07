@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-ann_index.py
-Optional ANN index wrapper using Annoy for fast nearest neighbor on color hist vectors.
-Falls back to brute-force search if Annoy is not installed.
+ann_index.py (extended)
+Adds update_ann_index to rebuild Annoy index only when cache changed (incremental behavior).
 """
 from __future__ import annotations
 import os
@@ -48,6 +47,37 @@ def build_annoy_index(cache_json_path: str, index_out_path: str, n_trees: int = 
     return True
 
 
+def update_ann_index(cache_json_path: str, index_out_path: str, n_trees: int = 10) -> bool:
+    """Incremental-aware update: rebuilds the Annoy index only if cache differs from existing meta.
+    Returns True if index was built/updated, False if unchanged or unavailable.
+    """
+    if not HAS_ANNOY:
+        # if Annoy not installed, nothing to do
+        return False
+    if not os.path.exists(cache_json_path):
+        return False
+    meta_path = index_out_path + '.meta'
+    try:
+        with open(cache_json_path, 'r', encoding='utf-8') as f:
+            cache = json.load(f)
+    except Exception:
+        return False
+    cache_paths = sorted(list(cache.keys()))
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+            existing_sorted = sorted(existing)
+            if existing_sorted == cache_paths:
+                # no change
+                return False
+        except Exception:
+            # proceed to rebuild
+            pass
+    # build new index
+    return build_annoy_index(cache_json_path, index_out_path, n_trees=n_trees)
+
+
 class AnnIndex:
     def __init__(self, index_prefix: str):
         self.index_prefix = index_prefix
@@ -65,11 +95,7 @@ class AnnIndex:
             raise FileNotFoundError('Annoy index or meta missing')
         with open(meta_path, 'r', encoding='utf-8') as f:
             self.paths = json.load(f)
-        # load one vector to get dim
-        # we need to create AnnoyIndex with correct dim; load requires dim
-        # read meta first vector length from cache may not be available; assume dim stored via file size? skip and try common dims
-        # Better: Annoy supports loading without knowing dim by creating pk and loading, but requires same dim on creation. So open .ann to infer not possible. We'll try dims 64, 128 fallback
-        # For simplicity assume dim 128 if not proviced. This is best-effort.
+        # try to infer dimension by attempting common dims
         for possible_dim in (256, 128, 64, 48, 32, 16):
             try:
                 t = AnnoyIndex(possible_dim, 'euclidean')
@@ -85,7 +111,6 @@ class AnnIndex:
         if self.index is None:
             return []
         if len(vec) != self.dim:
-            # Annoy requires same dim; cannot query. fallback
             return []
         ids, dists = self.index.get_nns_by_vector(vec, k, include_distances=True)
         out = []
