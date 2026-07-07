@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-beat_sync.py — minimal beat-sync renderer with plugin-driven VFX -> FFmpeg filter mapping
-This file integrates the plugin manager and maps plugin effect names to ffmpeg -vf filter strings.
+Updated beat_sync.py: expanded EFFECT_TEMPLATES with parameterized filter templates
+and Annoy-backed color continuity selection when available.
 """
 from __future__ import annotations
 import argparse
@@ -12,11 +12,12 @@ import time
 import random
 import json
 import os
-from typing import List
+from typing import List, Dict, Any, Optional
 
 from db import WeeditDB
 from clip_indexer import ClipIndexer
 from plugins import get_plugin_manager
+from ann_index import AnnIndex
 
 # simple defaults
 DEFAULT_MUSIC_DIR = Path(r"D:/Oidasheim/NFOs/mp3s")
@@ -24,25 +25,35 @@ DEFAULT_CLIPS_DIR = Path(r"D:/raw_vidz/grok")
 OUTPUT_DIR = Path(r"D:/Oidasheim/NFOs/done")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-EFFECTS_MAP = {
-    'colorgrade_mild': "eq=contrast=1.05:brightness=0.02:saturation=1.05",
-    'color_pop': "eq=contrast=1.15:saturation=1.2",
-    'neon_pulse': "colorchannelmixer=1.2:0:0:0:0:1.2:0:0:0:0:1.2",
-    'soft_fade': "fade=t=in:st=0:d=0.12",
+# Parameterized templates for common effects. Use .format(**params) to render.
+EFFECT_TEMPLATES: Dict[str, str] = {
+    'colorgrade_mild': "eq=contrast={contrast}:brightness={brightness}:saturation={saturation}",
+    'color_pop': "eq=contrast={contrast}:saturation={saturation}",
+    'neon_pulse': "colorbalance=rs={r}:gs={g}:bs={b}",
+    'soft_fade': "fade=t=in:st=0:d={d}",
     'clean': "",
-    'flash_white': "eq=brightness=0.15",
-    'wobble_zoom': "zoompan=z='1.0+0.02*sin(2*PI*t*2)':d=1",
-    'stutter': "tblend=all_mode='average'",
-    'flash_white': "eq=brightness=0.15",
+    'flash_white': "colorlevels=rimin=0:gimin=0:bimin=0:romax={bright}:gomax={bright}:bomax={bright}",
+    'wobble_zoom': "zoompan=z='if(gt(t,{start}),{zoom},1)':d=1",
+    'stutter': "tblend=all_mode='average',framestep=2",
+    'vignette': "vignette=PI/4:0.5"
 }
 
 
-def build_vf_from_effects(effects: List[str]) -> str:
+def build_vf_from_effects(effects: List[Any]) -> str:
     parts = []
     for e in effects:
-        f = EFFECTS_MAP.get(e)
-        if f:
-            parts.append(f)
+        # support either string (effect name) or dict {'effect':name,'params':{}}
+        name = e if isinstance(e, str) else e.get('effect')
+        params = {} if isinstance(e, str) else e.get('params', {})
+        tpl = EFFECT_TEMPLATES.get(name)
+        if not tpl:
+            continue
+        try:
+            vf = tpl.format(**params)
+        except Exception:
+            vf = tpl
+        if vf:
+            parts.append(vf)
     return ",".join(parts)
 
 
@@ -62,13 +73,30 @@ def simple_render_segment(ffmpeg, clip_path, start, dur, out_path, vf=''):
     subprocess.run(cmd, check=True)
 
 
-def choose_clip_for_segment(db: WeeditDB, desired_shot: str, rng: random.Random):
+def choose_clip_for_segment(db: WeeditDB, desired_shot: str, rng: random.Random, ann: Optional[AnnIndex] = None, prev_clip_path: Optional[str] = None) -> Dict[str, Any]:
     cands = db.get_all_clips()
-    # prefer same shot_type
+    if not cands:
+        raise RuntimeError('No clips available in DB')
+    # If ANN is available and prev_clip_path provided, query ANN for nearest by color
+    if ann and prev_clip_path:
+        prev = db.get_clip_metadata(prev_clip_path)
+        vec = prev.get('color_histogram') if prev else None
+        if vec and isinstance(vec, list):
+            try:
+                res = ann.query(vec, k=40)
+                paths = [r[0] for r in res]
+                # convert paths to clip meta
+                pool = [c for c in cands if c['path'] in paths]
+                if pool:
+                    # prefer same shot type if possible
+                    same_shot = [c for c in pool if c.get('shot_type') == desired_shot]
+                    pool = same_shot if same_shot else pool
+                    return rng.choice(pool)
+            except Exception:
+                pass
+    # fallback: prefer same shot
     same = [c for c in cands if c.get('shot_type') == desired_shot]
     pool = same if same else cands
-    if not pool:
-        raise RuntimeError('No clips available in DB')
     return rng.choice(pool)
 
 
@@ -82,6 +110,13 @@ def concat_and_mux(ffmpeg: str, segment_paths: List[str], music_path: Path, outp
     subprocess.run([ffmpeg, '-y', '-i', str(silent_video), '-i', str(music_path), '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', str(output_path)], check=True)
 
 
+def load_ann_index_if_available(prefix: str):
+    try:
+        return AnnIndex(prefix)
+    except Exception:
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--music-dir', default=str(DEFAULT_MUSIC_DIR))
@@ -90,20 +125,22 @@ def main():
     parser.add_argument('--use-shot-matching', action='store_true')
     parser.add_argument('--reindex', action='store_true')
     parser.add_argument('--db', default=r'D:/Oidasheim/weedit/weedit_v4.db')
+    parser.add_argument('--ann-prefix', default=r'D:/Oidasheim/weedit/weedit_color_index')
     args = parser.parse_args()
 
     ffmpeg = require_tool('ffmpeg')
     ffprobe = require_tool('ffprobe')
 
     db = WeeditDB(args.db)
-    db._init_db()  # ensure schema present
+    db._init_db()
 
     idx = ClipIndexer()
     if args.reindex:
         print('Reindexing...')
-        idx.index_all()
+        idx.scan_and_index(args.clips_dir, args.db)
 
-    # load plugin manager
+    ann = load_ann_index_if_available(args.ann_prefix)
+
     pm = get_plugin_manager()
 
     # select music
@@ -118,7 +155,6 @@ def main():
 
     # duration probe
     try:
-        import json
         r = subprocess.run([ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', str(music_path)], capture_output=True, text=True, timeout=10)
         duration = float(r.stdout.strip())
     except Exception:
@@ -138,7 +174,6 @@ def main():
 
     # for each segment, ask plugins for suggested effects
     for seg in segments:
-        # allow plugin to inspect segment metadata and suggest effects
         try:
             plugin_effects = pm.select_effects(seg)
         except Exception:
@@ -152,14 +187,16 @@ def main():
     with tempfile.TemporaryDirectory(prefix='weedit_') as td:
         work_dir = Path(td)
         segment_paths = []
+        prev_clip = None
         for i, seg in enumerate(segments):
             desired_shot = rng.choice(['standard', 'wide', 'action', 'static', 'cutaway']) if args.use_shot_matching else 'standard'
-            clip_meta = choose_clip_for_segment(db, desired_shot, rng)
+            clip_meta = choose_clip_for_segment(db, desired_shot, rng, ann=ann, prev_clip_path=prev_clip)
             vf = build_vf_from_effects(seg.get('effects', []))
             out_seg = work_dir / f'seg_{i:04d}.mp4'
             try:
                 simple_render_segment(ffmpeg, clip_meta['path'], 0.0, seg['dur'], out_seg, vf=vf)
                 segment_paths.append(str(out_seg))
+                prev_clip = clip_meta['path']
             except Exception as e:
                 print('Failed render segment:', e)
 
