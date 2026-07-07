@@ -1,64 +1,65 @@
 #!/usr/bin/env python3
-# watcher.py
+# -*- coding: utf-8 -*-
 """
-Folder watcher daemon: watches clip folders and triggers indexer for new files.
-Requires watchdog (pip install watchdog)
-Usage:
-    python watcher.py --watch D:/raw_vidz/grok --db D:/Oidasheim/weedit/weedit_v4.db
+watcher.py
+Watches configured clip directories and triggers the clip_indexer on file system changes.
+Requires watchdog package.
 """
 from __future__ import annotations
-
-import argparse
-import threading
 import time
+import subprocess
+import sys
 from pathlib import Path
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
-try:
-    from watchdog.observers import Observer
-    from watchdog.events import FileSystemEventHandler
-except Exception:
-    print('Please install watchdog: pip install watchdog')
-    raise
+DEFAULT_CLIPS = [
+    r"D:/raw_vidz/grok",
+    r"/media/Stuff/raw_vidz/grok",
+    r"/ubu/Stuff/raw_vidz/grok",
+    r"\\ubu\\Stuff\\raw_vidz\\grok",
+]
+DEFAULT_DB = r"D:/Oidasheim/weedit/weedit_v4.db"
 
 
-class ClipEventHandler(FileSystemEventHandler):
-    def __init__(self, db_path: Path):
+class _ReindexHandler(FileSystemEventHandler):
+    def __init__(self, clips_dir: str, db_path: str):
+        self.clips_dir = clips_dir
         self.db_path = db_path
+        self._last = 0
 
-    def on_created(self, event):
-        if event.is_directory:
+    def on_any_event(self, event):
+        # debounce rapid events
+        now = time.time()
+        if now - self._last < 2.0:
             return
-        p = Path(event.src_path)
-        if p.suffix.lower() in ('.mp4','.mov','.mkv','.avi'):
-            # call indexer for this file
-            from clip_indexer import ensure_db, index_clip
-            conn = ensure_db(self.db_path)
-            print(f"[watcher] New clip detected: {p.name}")
-            index_clip(conn, p, force=True)
-            conn.close()
+        self._last = now
+        print(f"Change detected: {event.src_path}. Triggering indexer...")
+        try:
+            subprocess.Popen([sys.executable, 'clip_indexer.py', '--clips', self.clips_dir, '--db', self.db_path])
+        except Exception as e:
+            print(f"Failed to spawn indexer: {e}")
 
 
-def run_watch(path: Path, db_path: Path):
-    event_handler = ClipEventHandler(db_path)
-    observer = Observer()
-    observer.schedule(event_handler, str(path), recursive=True)
-    observer.start()
-    print(f"Watching {path} ...")
+def start_watcher(clips_dir: str = None, db_path: str = DEFAULT_DB):
+    clips_dir = clips_dir or DEFAULT_CLIPS[0]
+    handler = _ReindexHandler(clips_dir, db_path)
+    obs = Observer()
+    obs.schedule(handler, clips_dir, recursive=True)
+    obs.start()
+    print(f"Watching {clips_dir} for changes. Press Ctrl+C to stop.")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--watch', '-w', required=True)
-    parser.add_argument('--db', default=r"D:/Oidasheim/weedit/weedit_v4.db")
-    args = parser.parse_args()
-    run_watch(Path(args.watch), Path(args.db))
+        obs.stop()
+    obs.join()
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--clips', default=None)
+    parser.add_argument('--db', default=DEFAULT_DB)
+    args = parser.parse_args()
+    start_watcher(args.clips, args.db)
