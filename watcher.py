@@ -1,78 +1,54 @@
 #!/usr/bin/env python3
-# watcher.py - Background folder watcher to keep clip index up-to-date
+# watcher.py
+"""
+Simple background folder watcher that triggers clip indexer updates when new files arrive.
+Requires watchdog.
+"""
 import time
-import logging
 from pathlib import Path
-from typing import List
+import subprocess
+import sys
 
 try:
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
 except ImportError:
-    Observer = None
-    FileSystemEventHandler = object
+    print('Please install watchdog: pip install watchdog')
+    sys.exit(1)
 
-from clip_indexer import ClipIndexer
-from clip_pools import resolve_pools
-
-LOG = logging.getLogger("weedit.watcher")
-
-class _IndexEventHandler(FileSystemEventHandler):
-    def __init__(self, indexer: ClipIndexer, watched_dirs: List[Path]):
-        self.indexer = indexer
-        self.watched = set(str(p.resolve()) for p in watched_dirs)
-
+class _EventHandler(FileSystemEventHandler):
+    def __init__(self, index_cmd: str):
+        super().__init__()
+        self.index_cmd = index_cmd
     def on_created(self, event):
-        path = getattr(event, 'src_path', None)
-        if not path: return
-        LOG.info("FS event created: %s", path)
-        self.indexer.index_path(path)
-
-    def on_modified(self, event):
-        path = getattr(event, 'src_path', None)
-        if not path: return
-        LOG.debug("FS event modified: %s", path)
-        self.indexer.index_path(path)
-
+        if event.is_directory: return
+        print(f"[watcher] file created: {event.src_path}")
+        subprocess.Popen(self.index_cmd, shell=True)
     def on_moved(self, event):
-        path = getattr(event, 'dest_path', None)
-        if not path: return
-        LOG.info("FS event moved: %s", path)
-        self.indexer.index_path(path)
+        if event.is_directory: return
+        print(f"[watcher] file moved: {event.dest_path}")
+        subprocess.Popen(self.index_cmd, shell=True)
 
 
-def start_watcher(indexer: ClipIndexer, pool_tags: List[str] | None = None, poll_interval: float = 1.0):
-    """Start a background watcher that observes resolved clip pools and calls the indexer."""
-    dirs = resolve_pools(tags_filter=pool_tags, verbose=False)
-    watch_dirs = [Path(d) for d in dirs]
-
-    if Observer is None:
-        LOG.warning("watchdog not installed — falling back to periodic rescan (poll every %ss)", poll_interval)
-        try:
-            while True:
-                indexer.reindex_if_needed()
-                time.sleep(poll_interval)
-        except KeyboardInterrupt:
-            LOG.info("Watcher stopped")
-        return
-
+def main(paths):
+    index_cmd = 'python clip_indexer.py --reindex'
+    handler = _EventHandler(index_cmd)
     obs = Observer()
-    handler = _IndexEventHandler(indexer, watch_dirs)
-    for d in watch_dirs:
-        LOG.info("Watching %s", d)
-        obs.schedule(handler, str(d), recursive=True)
+    for p in paths:
+        print(f"[watcher] watching: {p}")
+        obs.schedule(handler, str(p), recursive=True)
     obs.start()
-
     try:
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:
-        LOG.info("Stopping watcher...")
         obs.stop()
     obs.join()
 
-
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    idx = ClipIndexer()
-    start_watcher(idx)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('paths', nargs='*')
+    args = parser.parse_args()
+    watch_paths = args.paths if args.paths else ['D:/raw_vidz/grok']
+    main(watch_paths)

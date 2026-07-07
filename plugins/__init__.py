@@ -1,25 +1,33 @@
 # plugins/__init__.py
-"""Simple plugin loader for weedit plugins.
-Plugins must expose a `Plugin` class with a `process(timeline, ctx)` method.
 """
+Plugin loader for WE.ED.IT. Plugins must define a `Plugin` class with
+`process(timeline: list) -> list` method.
+"""
+from importlib import import_module
 from pathlib import Path
-import importlib.util
-import sys
+import pkgutil
 
-PLUGINS_DIR = Path(__file__).parent
+PLUGINS = {}
 
 
-def load_plugins(directory: Path = None):
-    directory = directory or PLUGINS_DIR
-    plugins = []
-    for p in directory.glob('plugin_*.py'):
-        spec = importlib.util.spec_from_file_location(p.stem, str(p))
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[p.stem] = mod
+def load_plugins(pkg='plugins'):
+    root = Path(__file__).parent
+    for finder, name, ispkg in pkgutil.iter_modules([str(root)]):
+        if name.startswith('_'):
+            continue
         try:
-            spec.loader.exec_module(mod)  # type: ignore
-            if hasattr(mod, 'Plugin'):
-                plugins.append(mod.Plugin())
-        except Exception as e:
-            print(f"Failed to load plugin {p}: {e}")
-    return plugins
+            m = import_module(f'plugins.{name}')
+            if hasattr(m, 'Plugin'):
+                PLUGINS[name] = m.Plugin()
+        except Exception:
+            pass
+    return PLUGINS
+
+
+def apply_plugins(timeline: list) -> list:
+    for name, plugin in PLUGINS.items():
+        try:
+            timeline = plugin.process(timeline)
+        except Exception:
+            pass
+    return timeline
